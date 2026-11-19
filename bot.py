@@ -110,6 +110,13 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_words_available
                 ON words(room_id, used_round);
+
+            CREATE TABLE IF NOT EXISTS room_panels (
+                room_id       INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                user_id       INTEGER NOT NULL,
+                message_id    INTEGER NOT NULL,
+                PRIMARY KEY (room_id, user_id)
+            );
             """
         )
         room_columns = {
@@ -227,6 +234,40 @@ def db_get_members(room_id: int) -> list[dict[str, Any]]:
             (room_id,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+def db_get_panel_message_id(room_id: int, user_id: int) -> int | None:
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT message_id
+            FROM room_panels
+            WHERE room_id = ? AND user_id = ?
+            """,
+            (room_id, user_id),
+        ).fetchone()
+        return int(row["message_id"]) if row else None
+
+
+def db_set_panel_message_id(room_id: int, user_id: int, message_id: int) -> None:
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO room_panels(room_id, user_id, message_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT(room_id, user_id)
+            DO UPDATE SET message_id = excluded.message_id
+            """,
+            (room_id, user_id, message_id),
+        )
+
+
+def db_delete_panel_message_id(room_id: int, user_id: int) -> None:
+    with get_connection() as connection:
+        connection.execute(
+            "DELETE FROM room_panels WHERE room_id = ? AND user_id = ?",
+            (room_id, user_id),
+        )
 
 
 def db_join_room(
@@ -517,6 +558,10 @@ def db_leave_room(room_id: int, user_id: int) -> tuple[bool, str]:
             return False, "Комната уже удалена."
         connection.execute(
             "DELETE FROM members WHERE room_id = ? AND user_id = ?",
+            (room_id, user_id),
+        )
+        connection.execute(
+            "DELETE FROM room_panels WHERE room_id = ? AND user_id = ?",
             (room_id, user_id),
         )
         if int(room["owner_id"]) == user_id:
@@ -821,11 +866,30 @@ async def show_room_message(message: Message, room_id: int, user_id: int) -> Non
         return
     db_touch_room(room_id)
     members = db_get_members(room_id)
-    await message.answer(
-        room_panel_text(room, members),
-        reply_markup=room_keyboard(room, user_id),
-        parse_mode="HTML",
-    )
+    text = room_panel_text(room, members)
+    markup = room_keyboard(room, user_id)
+    panel_message_id = db_get_panel_message_id(room_id, user_id)
+    if panel_message_id is not None:
+        try:
+            await message.bot.edit_message_text(
+                chat_id=user_id,
+                message_id=panel_message_id,
+                text=text,
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
+            return
+        except TelegramBadRequest as error:
+            if "message is not modified" in str(error).lower():
+                return
+            if not any(
+                phrase in str(error).lower()
+                for phrase in ("message to edit not found", "message_id_invalid")
+            ):
+                logger.warning("Failed to update room panel for %s: %s", user_id, error)
+                return
+    panel = await message.answer(text, reply_markup=markup, parse_mode="HTML")
+    db_set_panel_message_id(room_id, user_id, panel.message_id)
 
 
 async def edit_room_panel(callback: CallbackQuery, room_id: int) -> None:
@@ -846,9 +910,13 @@ async def edit_room_panel(callback: CallbackQuery, room_id: int) -> None:
     if callback.message:
         try:
             await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+            db_set_panel_message_id(room_id, user_id, callback.message.message_id)
         except TelegramBadRequest as error:
             if "message is not modified" not in str(error).lower():
-                await callback.message.answer(text, reply_markup=markup, parse_mode="HTML")
+                panel = await callback.message.answer(
+                    text, reply_markup=markup, parse_mode="HTML"
+                )
+                db_set_panel_message_id(room_id, user_id, panel.message_id)
 
 
 async def send_room_panels(bot: Bot, room_id: int) -> None:
@@ -862,17 +930,37 @@ async def send_room_panels(bot: Bot, room_id: int) -> None:
         for member in members
     }
     for member in members:
+        user_id = int(member["user_id"])
+        message_id = db_get_panel_message_id(room_id, user_id)
+        if message_id is None:
+            continue
         try:
-            await bot.send_message(
-                int(member["user_id"]),
-                text,
-                reply_markup=markup_by_user[int(member["user_id"])],
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=markup_by_user[user_id],
                 parse_mode="HTML",
             )
+        except TelegramBadRequest as error:
+            if message_id is not None and any(
+                phrase in str(error).lower()
+                for phrase in ("message to edit not found", "message_id_invalid")
+            ):
+                try:
+                    panel = await bot.send_message(
+                        user_id,
+                        text,
+                        reply_markup=markup_by_user[user_id],
+                        parse_mode="HTML",
+                    )
+                    db_set_panel_message_id(room_id, user_id, panel.message_id)
+                except Exception:
+                    logger.exception("Failed to replace room panel for %s", user_id)
+            elif "message is not modified" not in str(error).lower():
+                logger.warning("Failed to update room panel for %s: %s", user_id, error)
         except Exception:
-            logger.exception(
-                "Failed to send updated room panel to %s", member["user_id"]
-            )
+            logger.exception("Failed to update room panel for %s", user_id)
 
 
 async def prompt_room_for_words(bot: Bot, room_id: int, text: str) -> None:
@@ -1131,7 +1219,7 @@ async def process_room_password(message: Message, state: FSMContext) -> None:
 
 
 @dp.callback_query(F.data == "menu:join")
-async def callback_join_room(callback: CallbackQuery, state: FSMContext) -> None:
+async def callback_join_room(callback: CallbackQuery) -> None:
     if db_get_user_room(callback.from_user.id):
         await callback.answer("Ты уже состоишь в комнате.", show_alert=True)
         return
@@ -1298,7 +1386,6 @@ async def process_word(message: Message, state: FSMContext) -> None:
     if len(word) > MAX_WORD_LENGTH:
         await message.answer(f"Слишком длинно. Максимум {MAX_WORD_LENGTH} символов:")
         return
-    data = await state.get_data()
     await state.update_data(pending_word=word)
     await state.set_state(SubmitWord.waiting_for_confirmation)
     await message.answer(
