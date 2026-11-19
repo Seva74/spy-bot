@@ -1,0 +1,24 @@
+[Unit]
+Description=Telegram Spy Game Bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=spybot
+Group=spybot
+WorkingDirectory=/opt/spybot
+EnvironmentFile=/opt/spybot/.env
+ExecStart=/opt/spybot/venv/bin/python /opt/spybot/bot.py
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/spybot/data
+
+[Install]
+WantedBy=multi-user.target
