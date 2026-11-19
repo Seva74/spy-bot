@@ -33,6 +33,7 @@ MIN_PASSWORD_LENGTH = 4
 MAX_PASSWORD_LENGTH = 64
 MAX_WORD_LENGTH = 80
 REFILL_THRESHOLD = 3
+ROOM_INACTIVITY_SECONDS = 24 * 60 * 60
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -77,7 +78,8 @@ def init_db() -> None:
                 phase               TEXT NOT NULL DEFAULT 'lobby',
                 collection_cycle    INTEGER NOT NULL DEFAULT 0,
                 round_no            INTEGER NOT NULL DEFAULT 0,
-                created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_activity_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_name_nocase
@@ -105,6 +107,23 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_words_available
                 ON words(room_id, used_round);
+            """
+        )
+        room_columns = {
+            str(column["name"])
+            for column in connection.execute("PRAGMA table_info(rooms)").fetchall()
+        }
+        if "last_activity_at" not in room_columns:
+            connection.execute(
+                """
+                ALTER TABLE rooms
+                ADD COLUMN last_activity_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                """
+            )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_rooms_last_activity
+                ON rooms(last_activity_at)
             """
         )
 
@@ -186,7 +205,6 @@ def db_list_open_rooms() -> list[dict[str, Any]]:
             SELECT r.id, r.name, r.owner_id, COUNT(m.user_id) AS member_count
             FROM rooms AS r
             JOIN members AS m ON m.room_id = r.id
-            WHERE r.phase = 'lobby'
             GROUP BY r.id
             ORDER BY r.created_at, r.id
             """
@@ -223,8 +241,6 @@ def db_join_room(
             ).fetchone()
             if room is None:
                 return False, "Эта комната уже не существует."
-            if room["phase"] != "lobby":
-                return False, "Игра в этой комнате уже началась — присоединиться нельзя."
             existing = connection.execute(
                 "SELECT room_id FROM members WHERE user_id = ?", (user_id,)
             ).fetchone()
@@ -238,8 +254,15 @@ def db_join_room(
                 """
                 INSERT INTO members(room_id, user_id, display_name, username)
                 VALUES (?, ?, ?, ?)
+                ON CONFLICT(room_id, user_id)
+                DO UPDATE SET display_name = excluded.display_name,
+                              username = excluded.username
                 """,
                 (room_id, user_id, display_name, username),
+            )
+            connection.execute(
+                "UPDATE rooms SET last_activity_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (room_id,),
             )
         return True, "Ты успешно вошёл в комнату."
     except sqlite3.IntegrityError:
@@ -251,7 +274,9 @@ def db_start_collection(room_id: int) -> bool:
         cursor = connection.execute(
             """
             UPDATE rooms
-            SET phase = 'collecting', collection_cycle = collection_cycle + 1
+            SET phase = 'collecting',
+                collection_cycle = collection_cycle + 1,
+                last_activity_at = CURRENT_TIMESTAMP
             WHERE id = ? AND phase = 'lobby'
             """,
             (room_id,),
@@ -285,9 +310,18 @@ def db_submit_word(room_id: int, user_id: int, word: str) -> tuple[bool, str, in
             """,
             (room_id, cycle, user_id, word),
         )
+        connection.execute(
+            "UPDATE rooms SET last_activity_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (room_id,),
+        )
         submitted = int(
             connection.execute(
-                "SELECT COUNT(*) FROM words WHERE room_id = ? AND cycle = ?",
+                """
+                SELECT COUNT(*)
+                FROM words AS w
+                JOIN members AS m ON m.room_id = w.room_id AND m.user_id = w.author_id
+                WHERE w.room_id = ? AND w.cycle = ?
+                """,
                 (room_id, cycle),
             ).fetchone()[0]
         )
@@ -359,7 +393,9 @@ def db_begin_refill(room_id: int, expected_round_no: int) -> bool:
         connection.execute(
             """
             UPDATE rooms
-            SET phase = 'refilling', collection_cycle = collection_cycle + 1
+            SET phase = 'refilling',
+                collection_cycle = collection_cycle + 1,
+                last_activity_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
             (room_id,),
@@ -419,7 +455,12 @@ def db_commit_round(
             )
             submitted_count = int(
                 connection.execute(
-                    "SELECT COUNT(*) FROM words WHERE room_id = ? AND cycle = ?",
+                    """
+                    SELECT COUNT(*)
+                    FROM words AS w
+                    JOIN members AS m ON m.room_id = w.room_id AND m.user_id = w.author_id
+                    WHERE w.room_id = ? AND w.cycle = ?
+                    """,
                     (room_id, int(room["collection_cycle"])),
                 ).fetchone()[0]
             )
@@ -437,7 +478,13 @@ def db_commit_round(
         if cursor.rowcount != 1:
             return False
         connection.execute(
-            "UPDATE rooms SET phase = 'active', round_no = ? WHERE id = ?",
+            """
+            UPDATE rooms
+            SET phase = 'active',
+                round_no = ?,
+                last_activity_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
             (expected_round_no + 1, room_id),
         )
         return True
@@ -448,7 +495,8 @@ def db_end_game(room_id: int) -> bool:
         cursor = connection.execute(
             """
             UPDATE rooms
-            SET phase = 'lobby'
+            SET phase = 'lobby',
+                last_activity_at = CURRENT_TIMESTAMP
             WHERE id = ? AND phase IN ('collecting', 'active', 'refilling')
             """,
             (room_id,),
@@ -464,14 +512,38 @@ def db_leave_room(room_id: int, user_id: int) -> tuple[bool, str]:
         ).fetchone()
         if room is None:
             return False, "Комната уже удалена."
-        if int(room["owner_id"]) == user_id:
-            return False, "Создатель не может выйти из комнаты — он может её закрыть."
-        if room["phase"] != "lobby":
-            return False, "Во время игры выйти нельзя. Попроси создателя завершить игру."
         connection.execute(
             "DELETE FROM members WHERE room_id = ? AND user_id = ?",
             (room_id, user_id),
         )
+        if int(room["owner_id"]) == user_id:
+            new_owner = connection.execute(
+                """
+                SELECT user_id
+                FROM members
+                WHERE room_id = ?
+                ORDER BY joined_at, user_id
+                LIMIT 1
+                """,
+                (room_id,),
+            ).fetchone()
+            if new_owner:
+                connection.execute(
+                    """
+                    UPDATE rooms
+                    SET owner_id = ?,
+                        last_activity_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (int(new_owner["user_id"]), room_id),
+                )
+            else:
+                connection.execute("DELETE FROM rooms WHERE id = ?", (room_id,))
+        else:
+            connection.execute(
+                "UPDATE rooms SET last_activity_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (room_id,),
+            )
         return True, "Ты вышел из комнаты."
 
 
@@ -493,6 +565,47 @@ def db_delete_room(room_id: int, owner_id: int) -> list[dict[str, Any]] | None:
         result = [dict(row) for row in members]
         connection.execute("DELETE FROM rooms WHERE id = ?", (room_id,))
         return result
+
+
+def db_cleanup_expired_rooms(hours: int = 24) -> list[dict[str, Any]]:
+    with get_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        cutoff = f"-{hours} hours"
+        rooms = connection.execute(
+            """
+            SELECT r.id, r.name
+            FROM rooms AS r
+            WHERE datetime(r.last_activity_at) <= datetime('now', ?)
+            """,
+            (cutoff,),
+        ).fetchall()
+        expired: list[dict[str, Any]] = []
+        for room in rooms:
+            room_id = int(room["id"])
+            members = connection.execute(
+                "SELECT user_id, display_name FROM members WHERE room_id = ?",
+                (room_id,),
+            ).fetchall()
+            expired.append({
+                "id": room_id,
+                "name": str(room["name"]),
+                "members": [dict(member) for member in members],
+            })
+            connection.execute("DELETE FROM rooms WHERE id = ?", (room_id,))
+        return expired
+
+
+def db_touch_room(room_id: int) -> bool:
+    with get_connection() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE rooms
+            SET last_activity_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (room_id,),
+        )
+        return cursor.rowcount == 1
 
 
 # ---------------------------------------------------------------------------
@@ -590,12 +703,12 @@ def room_keyboard(room: dict[str, Any], user_id: int) -> InlineKeyboardMarkup:
                     text="🗑 Закрыть комнату", callback_data=f"close:{room_id}"
                 )
             ])
-        else:
-            rows.append([
-                InlineKeyboardButton(
-                    text="🚪 Выйти из комнаты", callback_data=f"leave:{room_id}"
-                )
-            ])
+    rows.append([
+        InlineKeyboardButton(
+            text="🚪 ВЫЙТИ ИЗ ИГРЫ",
+            callback_data=f"leave:{room_id}",
+        )
+    ])
 
     rows.append([
         InlineKeyboardButton(text="🔄 Обновить", callback_data=f"refresh:{room_id}")
@@ -680,6 +793,7 @@ async def show_room_message(message: Message, room_id: int, user_id: int) -> Non
     if user_id not in member_ids:
         await message.answer("Ты не состоишь в этой комнате.")
         return
+    db_touch_room(room_id)
     members = db_get_members(room_id)
     await message.answer(
         room_panel_text(room, members), reply_markup=room_keyboard(room, user_id)
@@ -698,6 +812,7 @@ async def edit_room_panel(callback: CallbackQuery, room_id: int) -> None:
         if callback.message:
             await callback.message.answer("Ты не состоишь в этой комнате.")
         return
+    db_touch_room(room_id)
     text = room_panel_text(room, members)
     markup = room_keyboard(room, user_id)
     if callback.message:
@@ -972,7 +1087,7 @@ async def callback_join_room(callback: CallbackQuery, state: FSMContext) -> None
     keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:home")])
     if callback.message:
         await callback.message.answer(
-            "Выбери комнату. Здесь показаны комнаты, в которых ещё не началась игра:",
+            "Выбери комнату. Можно войти даже в уже начавшуюся игру:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
         )
 
@@ -985,8 +1100,8 @@ async def callback_select_room(callback: CallbackQuery, state: FSMContext) -> No
         await callback.answer("Некорректная комната.", show_alert=True)
         return
     room = db_get_room(room_id)
-    if not room or room["phase"] != "lobby":
-        await callback.answer("Комната уже недоступна.", show_alert=True)
+    if not room:
+        await callback.answer("Комната уже удалена.", show_alert=True)
         return
     if db_get_user_room(callback.from_user.id):
         await callback.answer("Ты уже состоишь в комнате.", show_alert=True)
@@ -1004,13 +1119,14 @@ async def process_join_password(message: Message, state: FSMContext) -> None:
     await delete_sensitive_message(message)
     data = await state.get_data()
     room_id = int(data["room_id"])
-    success, result = db_join_room(
-        room_id,
-        message.from_user.id,
-        user_display_name(message.from_user),
-        message.from_user.username,
-        password,
-    )
+    async with game_lock:
+        success, result = db_join_room(
+            room_id,
+            message.from_user.id,
+            user_display_name(message.from_user),
+            message.from_user.username,
+            password,
+        )
     if not success:
         await message.answer(result + "\nМожешь попробовать ещё раз или отправить /cancel.")
         return
@@ -1045,6 +1161,7 @@ async def callback_my_room(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("refresh:"))
 async def callback_refresh_room(callback: CallbackQuery) -> None:
     room_id = int((callback.data or "").split(":", 1)[1])
+    db_touch_room(room_id)
     await callback.answer()
     await edit_room_panel(callback, room_id)
 
@@ -1127,6 +1244,7 @@ async def callback_check_readiness(callback: CallbackQuery) -> None:
     if room["phase"] not in ("collecting", "refilling"):
         await callback.answer("Сейчас нет активного сбора слов.", show_alert=True)
         return
+    db_touch_room(room_id)
     members, submitted, total, _ = db_get_readiness(room_id)
     lines = [f"Готовность: {submitted}/{total}", ""]
     for member in members:
@@ -1217,7 +1335,8 @@ async def callback_end_game(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("leave:"))
 async def callback_leave_room(callback: CallbackQuery) -> None:
     room_id = int((callback.data or "").split(":", 1)[1])
-    success, result = db_leave_room(room_id, callback.from_user.id)
+    async with game_lock:
+        success, result = db_leave_room(room_id, callback.from_user.id)
     await callback.answer(result, show_alert=not success)
     if success:
         await notify_room(
@@ -1310,9 +1429,36 @@ async def main() -> None:
     bot = Bot(token=BOT_TOKEN)
     me = await bot.get_me()
     logger.info("Starting @%s (database: %s)", me.username, DB_PATH)
+
+    async def cleanup_expired_rooms_once() -> None:
+        expired_rooms = db_cleanup_expired_rooms(24)
+        for room in expired_rooms:
+            logger.info("Deleted inactive room %s (%s)", room["id"], room["name"])
+            for member in room["members"]:
+                try:
+                    await bot.send_message(
+                        int(member["user_id"]),
+                        f"🗑 Комната «{room['name']}» удалена автоматически "
+                        "после 24 часов без активности.",
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not notify member %s about inactive room cleanup",
+                        member["user_id"],
+                    )
+
+    async def cleanup_expired_rooms() -> None:
+        await cleanup_expired_rooms_once()
+        while True:
+            await asyncio.sleep(60 * 60)
+            await cleanup_expired_rooms_once()
+
+    cleanup_task = asyncio.create_task(cleanup_expired_rooms())
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        cleanup_task.cancel()
+        await asyncio.gather(cleanup_task, return_exceptions=True)
         await bot.session.close()
 
 
