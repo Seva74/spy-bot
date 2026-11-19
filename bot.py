@@ -6,6 +6,7 @@ import hmac
 import html
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import unicodedata
@@ -32,7 +33,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 PASSWORD_ITERATIONS = 250_000
 MIN_PLAYERS = 3
 MAX_ROOM_NAME_LENGTH = 40
-MIN_PASSWORD_LENGTH = 4
+MIN_PASSWORD_LENGTH = 1
 MAX_PASSWORD_LENGTH = 64
 MAX_WORD_LENGTH = 80
 REFILL_THRESHOLD = 3
@@ -688,14 +689,20 @@ def user_display_name(user: Any) -> str:
 def member_mention(member: dict[str, Any]) -> str:
     display_name = " ".join(str(member.get("display_name") or "").split())
     username = str(member.get("username") or "").strip()
+    valid_username = re.fullmatch(r"[A-Za-z0-9_]{5,32}", username) is not None
     has_readable_name = any(
         unicodedata.category(character)[0] in {"L", "N"}
         for character in display_name
     )
     if not has_readable_name:
-        display_name = f"@{username}" if username else f"Игрок {member['user_id']}"
+        display_name = f"@{username}" if valid_username else f"Игрок {member['user_id']}"
+    href = (
+        f"https://t.me/{username}"
+        if valid_username
+        else f"tg://user?id={int(member['user_id'])}"
+    )
     return (
-        f'<a href="tg://user?id={int(member["user_id"])}">'
+        f'<a href="{href}">'
         f"{html.escape(display_name)}</a>"
     )
 
