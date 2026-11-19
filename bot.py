@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import html
 import logging
 import os
 import secrets
 import sqlite3
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.base import StorageKey
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 
@@ -624,6 +627,7 @@ class JoinRoom(StatesGroup):
 
 class SubmitWord(StatesGroup):
     waiting_for_word = State()
+    waiting_for_confirmation = State()
 
 
 dp = Dispatcher()
@@ -634,6 +638,27 @@ game_lock = asyncio.Lock()
 def user_display_name(user: Any) -> str:
     name = (getattr(user, "full_name", None) or "Игрок").replace("\n", " ").strip()
     return name[:80] or "Игрок"
+
+
+def member_mention(member: dict[str, Any]) -> str:
+    display_name = " ".join(str(member.get("display_name") or "").split())
+    username = str(member.get("username") or "").strip()
+    has_readable_name = any(
+        unicodedata.category(character)[0] in {"L", "N"}
+        for character in display_name
+    )
+    if not has_readable_name:
+        display_name = f"@{username}" if username else f"Игрок {member['user_id']}"
+    return (
+        f'<a href="tg://user?id={int(member["user_id"])}">'
+        f"{html.escape(display_name)}</a>"
+    )
+
+
+async def set_word_input_state(bot: Bot, user_id: int, room_id: int) -> None:
+    key = StorageKey(bot_id=bot.id, chat_id=user_id, user_id=user_id)
+    await dp.storage.set_state(key, SubmitWord.waiting_for_word)
+    await dp.storage.set_data(key, {"word_room_id": room_id})
 
 
 def main_menu_keyboard(has_room: bool) -> InlineKeyboardMarkup:
@@ -724,13 +749,14 @@ def room_panel_text(room: dict[str, Any], members: list[dict[str, Any]]) -> str:
         "active": "Игра идёт",
         "refilling": "Пополнение банка слов",
     }
-    owner_name = next(
-        (m["display_name"] for m in members if int(m["user_id"]) == int(room["owner_id"])),
-        "неизвестен",
+    owner = next(
+        (m for m in members if int(m["user_id"]) == int(room["owner_id"])),
+        None,
     )
+    owner_name = member_mention(owner) if owner else "неизвестен"
     available = db_count_available_words(int(room["id"]))
     lines = [
-        f"🏠 Комната: {room['name']}",
+        f"🏠 Комната: {html.escape(str(room['name']))}",
         f"👑 Создатель: {owner_name}",
         f"👥 Игроков: {len(members)}",
         f"📌 Статус: {phase_names.get(room['phase'], room['phase'])}",
@@ -740,7 +766,7 @@ def room_panel_text(room: dict[str, Any], members: list[dict[str, Any]]) -> str:
     ]
     for member in members:
         prefix = "👑 " if int(member["user_id"]) == int(room["owner_id"]) else "• "
-        lines.append(prefix + member["display_name"])
+        lines.append(prefix + member_mention(member))
 
     if room["phase"] == "lobby":
         lines.extend(["", "Создатель может начать сбор слов, когда все готовы."])
@@ -796,7 +822,9 @@ async def show_room_message(message: Message, room_id: int, user_id: int) -> Non
     db_touch_room(room_id)
     members = db_get_members(room_id)
     await message.answer(
-        room_panel_text(room, members), reply_markup=room_keyboard(room, user_id)
+        room_panel_text(room, members),
+        reply_markup=room_keyboard(room, user_id),
+        parse_mode="HTML",
     )
 
 
@@ -817,17 +845,55 @@ async def edit_room_panel(callback: CallbackQuery, room_id: int) -> None:
     markup = room_keyboard(room, user_id)
     if callback.message:
         try:
-            await callback.message.edit_text(text, reply_markup=markup)
+            await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
         except TelegramBadRequest as error:
             if "message is not modified" not in str(error).lower():
-                await callback.message.answer(text, reply_markup=markup)
+                await callback.message.answer(text, reply_markup=markup, parse_mode="HTML")
 
 
-async def notify_room(bot: Bot, room_id: int, text: str) -> list[str]:
+async def send_room_panels(bot: Bot, room_id: int) -> None:
+    room = db_get_room(room_id)
+    if room is None:
+        return
+    members = db_get_members(room_id)
+    text = room_panel_text(room, members)
+    markup_by_user = {
+        int(member["user_id"]): room_keyboard(room, int(member["user_id"]))
+        for member in members
+    }
+    for member in members:
+        try:
+            await bot.send_message(
+                int(member["user_id"]),
+                text,
+                reply_markup=markup_by_user[int(member["user_id"])],
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send updated room panel to %s", member["user_id"]
+            )
+
+
+async def prompt_room_for_words(bot: Bot, room_id: int, text: str) -> None:
+    for member in db_get_members(room_id):
+        member_id = int(member["user_id"])
+        await set_word_input_state(bot, member_id, room_id)
+        try:
+            await bot.send_message(member_id, text)
+        except Exception:
+            logger.exception("Failed to prompt member %s for a word", member_id)
+
+
+async def notify_room(
+    bot: Bot, room_id: int, text: str, parse_mode: str | None = None
+) -> list[str]:
     failed: list[str] = []
     for member in db_get_members(room_id):
         try:
-            await bot.send_message(int(member["user_id"]), text)
+            await bot.send_message(
+                int(member["user_id"]), text, parse_mode=parse_mode
+            )
         except (TelegramForbiddenError, TelegramBadRequest) as error:
             logger.warning("Cannot notify user %s: %s", member["user_id"], error)
             failed.append(member["display_name"])
@@ -1138,8 +1204,19 @@ async def process_join_password(message: Message, state: FSMContext) -> None:
         await notify_room(
             message.bot,
             room_id,
-            f"👋 В комнату «{room['name']}» присоединился игрок: {user_display_name(message.from_user)}.",
+            f"👋 В комнату «{html.escape(str(room['name']))}» присоединился игрок: "
+            f"{member_mention({'user_id': message.from_user.id, 'display_name': user_display_name(message.from_user), 'username': message.from_user.username})}.",
+            parse_mode="HTML",
         )
+        await send_room_panels(message.bot, room_id)
+        if room["phase"] in ("collecting", "refilling"):
+            await prompt_room_for_words(
+                message.bot,
+                room_id,
+                "📝 Ты присоединился во время сбора слов.\n"
+                "Сразу отправь одно слово или короткое словосочетание "
+                f"(до {MAX_WORD_LENGTH} символов).",
+            )
 
 
 @dp.callback_query(F.data == "menu:room")
@@ -1180,10 +1257,12 @@ async def callback_start_collection(callback: CallbackQuery) -> None:
         await callback.answer("Комната уже не ожидает начала игры.", show_alert=True)
         return
     await callback.answer("Сбор слов начался.")
-    await notify_room(
+    await prompt_room_for_words(
         callback.bot,
         room_id,
-        "📝 Начался сбор слов для банка. Нажми «Отправить / изменить слово» в панели комнаты и пришли одно слово.\n"
+        "📝 Начался сбор слов для банка.\n"
+        "Сразу отправь одно слово или короткое словосочетание "
+        f"(до {MAX_WORD_LENGTH} символов).\n"
         "Слово увидишь только ты и бот не покажет его другим игрокам.",
     )
     await edit_room_panel(callback, room_id)
@@ -1220,18 +1299,61 @@ async def process_word(message: Message, state: FSMContext) -> None:
         await message.answer(f"Слишком длинно. Максимум {MAX_WORD_LENGTH} символов:")
         return
     data = await state.get_data()
+    await state.update_data(pending_word=word)
+    await state.set_state(SubmitWord.waiting_for_confirmation)
+    await message.answer(
+        f"Подходит ли слово «{html.escape(word)}»?",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Да, отправить",
+                        callback_data="wordconfirm:yes",
+                    ),
+                    InlineKeyboardButton(
+                        text="✏️ Изменить слово",
+                        callback_data="wordconfirm:edit",
+                    ),
+                ]
+            ]
+        ),
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data == "wordconfirm:edit")
+async def callback_edit_word(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    if "word_room_id" not in data or await state.get_state() != SubmitWord.waiting_for_confirmation.state:
+        await callback.answer("Подтверждение слова уже недоступно.", show_alert=True)
+        return
+    await state.set_state(SubmitWord.waiting_for_word)
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer("Хорошо, отправь новое слово или словосочетание:")
+
+
+@dp.callback_query(F.data == "wordconfirm:yes")
+async def callback_confirm_word(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    if "word_room_id" not in data or "pending_word" not in data:
+        await callback.answer("Слово уже обработано или устарело.", show_alert=True)
+        return
     room_id = int(data["word_room_id"])
+    word = str(data["pending_word"])
     async with game_lock:
         success, result, submitted, total = db_submit_word(
-            room_id, message.from_user.id, word
+            room_id, callback.from_user.id, word
         )
     if not success:
         await state.clear()
-        await message.answer(result)
+        await callback.answer(result, show_alert=True)
         return
     await state.clear()
-    await message.answer(f"✅ {result}\nСлова отправили: {submitted} из {total}.")
-    await show_room_message(message, room_id, message.from_user.id)
+    await callback.answer("Слово отправлено.")
+    if callback.message:
+        await callback.message.answer(f"✅ {result}\nСлова отправили: {submitted} из {total}.")
+        await show_room_message(callback.message, room_id, callback.from_user.id)
 
 
 @dp.callback_query(F.data.startswith("ready:"))
@@ -1297,12 +1419,12 @@ async def callback_next_round(callback: CallbackQuery) -> None:
                 await callback.answer("Не удалось начать пополнение. Обнови комнату.", show_alert=True)
                 return
             await callback.answer("Пора пополнить банк слов.")
-            await notify_room(
+            await prompt_room_for_words(
                 callback.bot,
                 room_id,
                 f"📚 В банке осталось {available} слов.\n\n"
-                "Для следующего раунда каждый участник должен добавить новое слово. "
-                "Открой панель комнаты и нажми «Отправить / изменить слово». "
+                "Сразу отправь новое слово или короткое словосочетание "
+                f"(до {MAX_WORD_LENGTH} символов).\n"
                 "Старые неиспользованные слова останутся в банке.",
             )
             await edit_room_panel(callback, room_id)
@@ -1342,8 +1464,10 @@ async def callback_leave_room(callback: CallbackQuery) -> None:
         await notify_room(
             callback.bot,
             room_id,
-            f"Игрок {user_display_name(callback.from_user)} вышел из комнаты.",
+            f"Игрок {member_mention({'user_id': callback.from_user.id, 'display_name': user_display_name(callback.from_user), 'username': callback.from_user.username})} вышел из комнаты.",
+            parse_mode="HTML",
         )
+        await send_room_panels(callback.bot, room_id)
         if callback.message:
             current_room = db_get_user_room(callback.from_user.id)
             await callback.message.answer(
