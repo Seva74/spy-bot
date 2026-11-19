@@ -696,11 +696,7 @@ def member_mention(member: dict[str, Any]) -> str:
     )
     if not has_readable_name:
         display_name = f"@{username}" if valid_username else f"Игрок {member['user_id']}"
-    href = (
-        f"https://t.me/{username}"
-        if valid_username
-        else f"tg://user?id={int(member['user_id'])}"
-    )
+    href = f"tg://user?id={int(member['user_id'])}"
     return (
         f'<a href="{href}">'
         f"{html.escape(display_name)}</a>"
@@ -897,6 +893,23 @@ async def show_room_message(message: Message, room_id: int, user_id: int) -> Non
                 return
     panel = await message.answer(text, reply_markup=markup, parse_mode="HTML")
     db_set_panel_message_id(room_id, user_id, panel.message_id)
+
+
+async def replace_room_panel(message: Message, room_id: int, user_id: int) -> None:
+    panel_message_id = db_get_panel_message_id(room_id, user_id)
+    if panel_message_id is not None:
+        try:
+            await message.bot.delete_message(
+                chat_id=user_id,
+                message_id=panel_message_id,
+            )
+        except TelegramBadRequest as error:
+            if "message to delete not found" not in str(error).lower():
+                logger.warning("Failed to move room panel for %s: %s", user_id, error)
+                await show_room_message(message, room_id, user_id)
+                return
+        db_delete_panel_message_id(room_id, user_id)
+    await show_room_message(message, room_id, user_id)
 
 
 async def edit_room_panel(callback: CallbackQuery, room_id: int) -> None:
@@ -1447,7 +1460,7 @@ async def callback_confirm_word(callback: CallbackQuery, state: FSMContext) -> N
     await callback.answer("Слово отправлено.")
     if callback.message:
         await callback.message.answer(f"✅ {result}\nСлова отправили: {submitted} из {total}.")
-        await show_room_message(callback.message, room_id, callback.from_user.id)
+        await replace_room_panel(callback.message, room_id, callback.from_user.id)
 
 
 @dp.callback_query(F.data.startswith("ready:"))
