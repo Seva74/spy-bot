@@ -37,6 +37,7 @@ MIN_PASSWORD_LENGTH = 1
 MAX_PASSWORD_LENGTH = 64
 MAX_WORD_LENGTH = 80
 REFILL_THRESHOLD = 3
+MIN_WORDS_TO_START = 3
 ROOM_INACTIVITY_SECONDS = 24 * 60 * 60
 
 logging.basicConfig(
@@ -492,25 +493,18 @@ def db_commit_round(
         ):
             return False
 
-        if room["phase"] == "refilling":
-            member_count = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM members WHERE room_id = ?", (room_id,)
-                ).fetchone()[0]
-            )
-            submitted_count = int(
-                connection.execute(
-                    """
-                    SELECT COUNT(*)
-                    FROM words AS w
-                    JOIN members AS m ON m.room_id = w.room_id AND m.user_id = w.author_id
-                    WHERE w.room_id = ? AND w.cycle = ?
-                    """,
-                    (room_id, int(room["collection_cycle"])),
-                ).fetchone()[0]
-            )
-            if submitted_count < member_count:
-                return False
+        available_count = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM words
+                WHERE room_id = ? AND used_round IS NULL
+                """,
+                (room_id,),
+            ).fetchone()[0]
+        )
+        if available_count < MIN_WORDS_TO_START:
+            return False
 
         cursor = connection.execute(
             """
@@ -686,7 +680,7 @@ def user_display_name(user: Any) -> str:
     return name[:80] or "Игрок"
 
 
-def member_mention(member: dict[str, Any]) -> str:
+def member_label(member: dict[str, Any]) -> str:
     display_name = " ".join(str(member.get("display_name") or "").split())
     username = str(member.get("username") or "").strip()
     valid_username = re.fullmatch(r"[A-Za-z0-9_]{5,32}", username) is not None
@@ -696,10 +690,20 @@ def member_mention(member: dict[str, Any]) -> str:
     )
     if not has_readable_name:
         display_name = f"@{username}" if valid_username else f"Игрок {member['user_id']}"
-    href = f"tg://user?id={int(member['user_id'])}"
+    return display_name
+
+
+def member_mention(member: dict[str, Any]) -> str:
+    username = str(member.get("username") or "").strip()
+    valid_username = re.fullmatch(r"[A-Za-z0-9_]{5,32}", username) is not None
+    href = (
+        f"https://t.me/{username}"
+        if valid_username
+        else f"tg://user?id={int(member['user_id'])}"
+    )
     return (
         f'<a href="{href}">'
-        f"{html.escape(display_name)}</a>"
+        f"{html.escape(member_label(member))}</a>"
     )
 
 
@@ -830,7 +834,7 @@ def room_panel_text(room: dict[str, Any], members: list[dict[str, Any]]) -> str:
         lines.extend([
             "",
             f"Новые слова отправили: {submitted} из {total}.",
-            "Для следующего раунда нужно слово от каждого участника.",
+            f"Следующий раунд доступен, когда в банке минимум {MIN_WORDS_TO_START} слова.",
         ])
     else:
         lines.extend([
@@ -880,6 +884,7 @@ async def show_room_message(message: Message, room_id: int, user_id: int) -> Non
                 text=text,
                 reply_markup=markup,
                 parse_mode="HTML",
+                disable_web_page_preview=True,
             )
             return
         except TelegramBadRequest as error:
@@ -891,7 +896,12 @@ async def show_room_message(message: Message, room_id: int, user_id: int) -> Non
             ):
                 logger.warning("Failed to update room panel for %s: %s", user_id, error)
                 return
-    panel = await message.answer(text, reply_markup=markup, parse_mode="HTML")
+    panel = await message.answer(
+        text,
+        reply_markup=markup,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
     db_set_panel_message_id(room_id, user_id, panel.message_id)
 
 
@@ -929,12 +939,20 @@ async def edit_room_panel(callback: CallbackQuery, room_id: int) -> None:
     markup = room_keyboard(room, user_id)
     if callback.message:
         try:
-            await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+            await callback.message.edit_text(
+                text,
+                reply_markup=markup,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
             db_set_panel_message_id(room_id, user_id, callback.message.message_id)
         except TelegramBadRequest as error:
             if "message is not modified" not in str(error).lower():
                 panel = await callback.message.answer(
-                    text, reply_markup=markup, parse_mode="HTML"
+                    text,
+                    reply_markup=markup,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
                 )
                 db_set_panel_message_id(room_id, user_id, panel.message_id)
 
@@ -961,6 +979,7 @@ async def send_room_panels(bot: Bot, room_id: int) -> None:
                 text=text,
                 reply_markup=markup_by_user[user_id],
                 parse_mode="HTML",
+                disable_web_page_preview=True,
             )
         except TelegramBadRequest as error:
             if message_id is not None and any(
@@ -973,6 +992,7 @@ async def send_room_panels(bot: Bot, room_id: int) -> None:
                         text,
                         reply_markup=markup_by_user[user_id],
                         parse_mode="HTML",
+                        disable_web_page_preview=True,
                     )
                     db_set_panel_message_id(room_id, user_id, panel.message_id)
                 except Exception:
@@ -1000,14 +1020,17 @@ async def notify_room(
     for member in db_get_members(room_id):
         try:
             await bot.send_message(
-                int(member["user_id"]), text, parse_mode=parse_mode
+                int(member["user_id"]),
+                text,
+                parse_mode=parse_mode,
+                disable_web_page_preview=True,
             )
         except (TelegramForbiddenError, TelegramBadRequest) as error:
             logger.warning("Cannot notify user %s: %s", member["user_id"], error)
-            failed.append(member["display_name"])
+            failed.append(member_label(member))
         except Exception:
             logger.exception("Failed to notify user %s", member["user_id"])
-            failed.append(member["display_name"])
+            failed.append(member_label(member))
     return failed
 
 
@@ -1040,14 +1063,14 @@ async def start_round(
         )
         return
 
-    if room["phase"] == "refilling":
-        submitted_members, submitted, total, _ = db_get_readiness(room_id)
-        if submitted < total:
-            missing = [m["display_name"] for m in submitted_members if not m["submitted"]]
-            await callback.answer(
-                "Не все отправили слова: " + ", ".join(missing), show_alert=True
-            )
-            return
+    available_words = db_count_available_words(room_id)
+    if available_words < MIN_WORDS_TO_START:
+        await callback.answer(
+            f"Для старта нужно минимум {MIN_WORDS_TO_START} слова в банке. "
+            f"Сейчас доступно: {available_words}.",
+            show_alert=True,
+        )
+        return
 
     round_data, members = db_get_round_data(room_id)
     if not round_data or not round_data.get("selected_word"):
@@ -1069,7 +1092,7 @@ async def start_round(
         return
     first_speaker_id = secrets.choice(first_speaker_candidates)
     first_speaker_name = next(
-        member["display_name"]
+        member_label(member)
         for member in members
         if int(member["user_id"]) == first_speaker_id
     )
@@ -1094,7 +1117,7 @@ async def start_round(
             delivered.append(member_id)
         except Exception as error:
             logger.warning("Failed to send round DM to %s: %s", member_id, error)
-            failed_names.append(member["display_name"])
+            failed_names.append(member_label(member))
 
     if failed_names:
         for delivered_id in delivered:
@@ -1478,9 +1501,9 @@ async def callback_check_readiness(callback: CallbackQuery) -> None:
     lines = [f"Готовность: {submitted}/{total}", ""]
     for member in members:
         symbol = "✅" if member["submitted"] else "⏳"
-        lines.append(f"{symbol} {member['display_name']}")
+        lines.append(f"{symbol} {member_mention(member)}")
     if callback.message:
-        await callback.message.answer("\n".join(lines))
+        await callback.message.answer("\n".join(lines), parse_mode="HTML")
     await callback.answer()
 
 
